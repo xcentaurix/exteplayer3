@@ -1,18 +1,8 @@
 /*
- * DreamNextGen (AMLogic dreamone/dreamtwo) video output via the AML
- * /dev/amstream_vbuf port. Replaces the linuxdvb_mipsel video path
- * for boxes whose /dev/dvb/adapter0/video0 shim doesn't expose
- * AMSTREAM_IOC_PORT_INIT and silently drops every write (amstream
- * Video buffer stays Unalloc / wcnt=0, decoder hangs in CONNECTED).
- *
- * Init sequence mirrors libamcodec esplayer.c + Kodi AMLCodec.cpp:
- *   VFORMAT → VID → SYSINFO → PORT_INIT, then write Annex-B ES
- *   together with TSTAMP for the PTS.
- *
- * See codesnake/libamcodec/examples/esplayer.c for the canonical
- * userspace flow and quarnster/boxeebox-xbmc AMLCodec.cpp for the
- * dec_sysinfo field semantics (format=VIDEO_DEC_FORMAT_*, not
- * VFORMAT_*, and param = EXTERNAL_PTS | SYNC_OUTSIDE).
+ * DreamNextGen (AMLogic dreamone/dreamtwo) video output via the
+ * Dreambox-private DVB-API on /dev/dvb/adapter0/video0:
+ *   VIDEO_SET_DEC_SYSINFO  _IOWR('o', 65, struct dec_sysinfo)   48 B
+ *   VIDEO_SET_FRAME        _IOWR('o', 64, struct video_frame)  168 B
  */
 
 #ifdef HAVE_CONFIG_H
@@ -30,6 +20,12 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
+#include <sys/types.h>
+#include <sys/prctl.h>
+#include <time.h>
+#include <poll.h>
+#include <signal.h>
+#include <linux/dvb/video.h>
 
 #include "common.h"
 #include "output.h"
@@ -41,103 +37,109 @@
 #define cERR_DREAMVIDEO_NO_ERROR    0
 #define cERR_DREAMVIDEO_ERROR      -1
 
-#define DV_DBG(fmt, ...) do { fprintf(stderr, "[dream_video] " fmt "\n", ##__VA_ARGS__); } while (0)
+/* Dual-log: stderr (filtered by serviceapp) + /tmp/dream_video.log. */
+static void dv_log_emit(const char *line)
+{
+    static FILE *fp = NULL;
+    static int   tried = 0;
+    if (!fp && !tried) {
+        tried = 1;
+        fp = fopen("/tmp/dream_video.log", "a");
+        if (fp) setvbuf(fp, NULL, _IOLBF, 0);
+    }
+    if (!fp) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    fprintf(fp, "%02d:%02d:%02d.%03ld %s\n",
+            tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000, line);
+}
+#define DV_DBG(fmt, ...) do { \
+    char _dv_buf[512]; \
+    int _dv_n = snprintf(_dv_buf, sizeof(_dv_buf), "[dream_video] " fmt, ##__VA_ARGS__); \
+    fprintf(stderr, "%s\n", _dv_buf); \
+    if (_dv_n > 0) dv_log_emit(_dv_buf); \
+} while (0)
 
-/* AML amstream ioctls (linux-amlogic/include/linux/amlogic/amports/amstream.h
- * — note: 'int' in the macro encodes the ioctl number; the kernel copies
- * the struct from userspace itself, so the third arg of _IOW must literally
- * be 'int' here. Using e.g. 'struct aml_dec_sysinfo' would change the size
- * bits and yield a different ioctl number → ENOTTY.) */
-#define AMSTREAM_IOC_MAGIC      'S'
-#define AMSTREAM_IOC_VB_SIZE    _IOW(AMSTREAM_IOC_MAGIC, 0x01, int)
-#define AMSTREAM_IOC_VFORMAT    _IOW(AMSTREAM_IOC_MAGIC, 0x04, int)
-#define AMSTREAM_IOC_VID        _IOW(AMSTREAM_IOC_MAGIC, 0x06, int)
-#define AMSTREAM_IOC_SYSINFO    _IOW(AMSTREAM_IOC_MAGIC, 0x0a, int)
-#define AMSTREAM_IOC_TSTAMP     _IOW(AMSTREAM_IOC_MAGIC, 0x0e, int)
-#define AMSTREAM_IOC_PORT_INIT  _IO (AMSTREAM_IOC_MAGIC, 0x11)
-#define AMSTREAM_IOC_VPAUSE     _IOW(AMSTREAM_IOC_MAGIC, 0x17, int)
-
-/* vformat_t — passed to AMSTREAM_IOC_VFORMAT */
-#define AML_VFORMAT_MPEG12      0
-#define AML_VFORMAT_MPEG4       1
-#define AML_VFORMAT_H264        2
-#define AML_VFORMAT_MJPEG       3
-#define AML_VFORMAT_VC1         6
-#define AML_VFORMAT_AVS         7
-#define AML_VFORMAT_HEVC        11
-
-/* vdec_type_t — packed into dec_sysinfo.format */
-#define AML_DEC_FORMAT_MPEG4_5  3
-#define AML_DEC_FORMAT_H264     4
-#define AML_DEC_FORMAT_HEVC     15
-
-/* dec_sysinfo.param flag bits */
-#define AML_EXTERNAL_PTS        1
-#define AML_SYNC_OUTSIDE        2
-
-struct aml_dec_sysinfo {
+/* Dreambox-private DVB-API extensions. */
+struct dec_sysinfo {
     uint32_t format;
     uint32_t width;
     uint32_t height;
-    uint32_t rate;
+    uint32_t rate;          /* duration per frame in 96000-tick units */
     uint32_t extra;
     uint32_t status;
     uint32_t ratio;
-    void    *param;
+    void    *param;         /* 8 byte on aarch64 -> total 48 bytes  */
     uint64_t ratio64;
 };
 
-static const char VBUF_DEV[]    = "/dev/amstream_vbuf";
-static const char CNTL_DEV[]    = "/dev/amvideo";
+struct video_frame {
+    uint64_t       pts;           /* nanoseconds, GstClockTime style */
+    ssize_t        bytes[8];
+    const uint8_t *data[8];
+    int            is_phys_addr[8];
+};
 
-/* state */
-static pthread_mutex_t        dv_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int                    dv_fd = -1;          /* /dev/amstream_vbuf — ES writes */
-static int                    dv_cntl_fd = -1;     /* /dev/amvideo       — TSTAMP ioctl */
-static int                    dv_running = 0;
-static int                    dv_inited = 0;
-static unsigned long long     dv_current_pts = 0;
+#define VIDEO_SET_DEC_SYSINFO  _IOWR('o', 65, struct dec_sysinfo)
+#define VIDEO_SET_FRAME        _IOWR('o', 64, struct video_frame)
 
-/* saved tsync state — restored on close so we leave the system the way
- * the next consumer (Live-TV / GStreamer) found it. */
-static int                    dv_tsync_saved = 0;
-static int                    dv_tsync_saved_enable = 0;
-static int                    dv_tsync_saved_mode = 0;
+/* vdec_type_t — packed into dec_sysinfo.format. */
+#define DEC_FORMAT_MPEG4_5  3
+#define DEC_FORMAT_H264     4
+#define DEC_FORMAT_HEVC     15
 
-/* BCM streamtype (from exteplayer3's bcm_ioctls.h) → AML pair. */
-static int aml_format_for(int bcm_streamtype, uint32_t *vformat, uint32_t *dec_format)
+/* dec_sysinfo.param flag bits (kept as void *). */
+#define EXTERNAL_PTS 1
+#define SYNC_OUTSIDE 2
+
+/* Dream-mapped vstream_type_t for VIDEO_SET_STREAMTYPE (only H.264=1
+ * verified; MPEG2 / HEVC are best guesses). */
+#define DREAM_STREAMTYPE_MPEG2  0
+#define DREAM_STREAMTYPE_H264   1
+#define DREAM_STREAMTYPE_HEVC   8
+
+static const char VIDEO_DEV[]   = "/dev/dvb/adapter0/video0";
+static const char AMPOLL_DEV[]  = "/dev/amvideo_poll";
+
+static pthread_mutex_t       dv_mutex       = PTHREAD_MUTEX_INITIALIZER;
+static int                   dv_fd          = -1;
+static int                   dv_poll_fd     = -1;
+static int                   dv_inited      = 0;
+static int                   dv_playing     = 0;
+static unsigned long long    dv_current_pts = 0;
+static uint64_t              dv_frame_index   = 0;
+static uint64_t              dv_frame_dur_ns  = 20000000ULL;   /* 50 fps */
+
+/* Producer/consumer queue between av_read_frame and VIDEO_SET_FRAME. */
+#define DV_Q_CAP   256              /* ~5 s @ 50 fps */
+typedef struct {
+    uint8_t *data;
+    size_t   size;
+    int64_t  pts_90k;   /* -1 = unknown */
+} dv_qitem_t;
+
+static dv_qitem_t       dv_q[DV_Q_CAP];
+static int              dv_q_head    = 0;     /* producer writes here */
+static int              dv_q_tail    = 0;     /* consumer reads here  */
+static pthread_mutex_t  dv_q_mu      = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t   dv_q_nonemp  = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t   dv_q_nonfull = PTHREAD_COND_INITIALIZER;
+static pthread_t        dv_q_thread;
+static int              dv_q_running = 0;
+static int              dv_q_stop    = 0;
+
+/* sysfs helpers — best-effort, errors ignored. */
+static void dv_sysfs_write(const char *path, const char *value)
 {
-    switch (bcm_streamtype) {
-    case STREAMTYPE_MPEG2:        *vformat = AML_VFORMAT_MPEG12; *dec_format = 0; return 0;
-    case STREAMTYPE_MPEG1:        *vformat = AML_VFORMAT_MPEG12; *dec_format = 0; return 0;
-    case STREAMTYPE_MPEG4_Part2:  *vformat = AML_VFORMAT_MPEG4;  *dec_format = AML_DEC_FORMAT_MPEG4_5; return 0;
-    case STREAMTYPE_MPEG4_H264:   *vformat = AML_VFORMAT_H264;   *dec_format = AML_DEC_FORMAT_H264; return 0;
-    case STREAMTYPE_MPEG4_H265:   *vformat = AML_VFORMAT_HEVC;   *dec_format = AML_DEC_FORMAT_HEVC; return 0;
-    case STREAMTYPE_VC1:          *vformat = AML_VFORMAT_VC1;    *dec_format = 0; return 0;
-    case STREAMTYPE_MJPEG:        *vformat = AML_VFORMAT_MJPEG;  *dec_format = 0; return 0;
-    default:                      return -1;
-    }
-}
-
-/* AMlogic display sink blanks frames while disable_video != 0. The
- * value persists across processes (enigma2 / live-TV / Standby leave it
- * at 1 or 2). Re-enable on open. */
-static void dv_enable_display(void)
-{
-    FILE *f = fopen("/sys/class/video/disable_video", "w");
+    FILE *f = fopen(path, "w");
     if (!f) return;
-    fputs("0", f);
+    fputs(value, f);
     fclose(f);
 }
 
-/* Kernel tsync drives AV sync between our amstream_vbuf video PTS
- * (via AMSTREAM_IOC_TSTAMP) and dream_audio's pts_audio sysfs write.
- * Force on AND amaster mode — gst-plugin-dreamaudiosink leaves it
- * disabled, dreamvideosink/Live-TV leave it in pcrmaster (=2) which
- * waits for a transport-stream PCR HLS/file playback never delivers
- * (= video stutters). Save & restore the previous state so the next
- * consumer (Live-TV / GStreamer) finds the system it expects. */
-static int dv_read_sysfs_int(const char *path, int *out)
+static int dv_sysfs_read_int(const char *path, int *out)
 {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -149,31 +151,265 @@ static int dv_read_sysfs_int(const char *path, int *out)
     return 0;
 }
 
-static void dv_write_sysfs_int(const char *path, int v)
+/* dreamvideosink fasst freerun_mode / show_first_frame_nosync nicht an
+ * (runtime strace bestätigt). Wir auch nicht. disable_video=0 reicht
+ * damit das video plane sichtbar wird. */
+static void dv_enable_display(void)
 {
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "%d", v);
-    fclose(f);
+    dv_sysfs_write("/sys/class/video/disable_video", "0");
 }
 
-static void dv_setup_tsync(void)
+static void dv_restore_display(void)
 {
-    if (!dv_tsync_saved) {
-        if (dv_read_sysfs_int("/sys/class/tsync/enable", &dv_tsync_saved_enable) == 0 &&
-            dv_read_sysfs_int("/sys/class/tsync/mode",   &dv_tsync_saved_mode)   == 0)
-            dv_tsync_saved = 1;
+    /* no-op */
+}
+
+/* keep signal-handler stub for forward compat — no async sysfs restore needed */
+static void dv_install_signal_handlers(void) { }
+
+
+static int dv_streamtype_for(int bcm_streamtype, int *out)
+{
+    switch (bcm_streamtype) {
+    case STREAMTYPE_MPEG4_H264: *out = DREAM_STREAMTYPE_H264; return 0;
+    case STREAMTYPE_MPEG2:      *out = DREAM_STREAMTYPE_MPEG2; return 0;
+    case STREAMTYPE_MPEG1:      *out = DREAM_STREAMTYPE_MPEG2; return 0;
+    case STREAMTYPE_MPEG4_H265: *out = DREAM_STREAMTYPE_HEVC; return 0;
+    default: return -1;
     }
-    dv_write_sysfs_int("/sys/class/tsync/mode",   1);   /* 1 = amaster */
-    dv_write_sysfs_int("/sys/class/tsync/enable", 1);
 }
 
-static void dv_restore_tsync(void)
+static int dv_decformat_for(int bcm_streamtype, uint32_t *out)
 {
-    if (!dv_tsync_saved) return;
-    dv_write_sysfs_int("/sys/class/tsync/mode",   dv_tsync_saved_mode);
-    dv_write_sysfs_int("/sys/class/tsync/enable", dv_tsync_saved_enable);
-    dv_tsync_saved = 0;
+    switch (bcm_streamtype) {
+    case STREAMTYPE_MPEG4_H264: *out = DEC_FORMAT_H264; return 0;
+    case STREAMTYPE_MPEG4_H265: *out = DEC_FORMAT_HEVC; return 0;
+    case STREAMTYPE_MPEG2:      *out = 0; return 0;
+    case STREAMTYPE_MPEG1:      *out = 0; return 0;
+    default: return -1;
+    }
+}
+
+/* ----- Queue helpers + consumer thread -------------------------------- */
+
+static int dv_q_is_full_locked(void)  { return ((dv_q_head + 1) % DV_Q_CAP) == dv_q_tail; }
+static int dv_q_is_empty_locked(void) { return dv_q_head == dv_q_tail; }
+
+static int dv_q_depth_locked(void)
+{
+    return (dv_q_head - dv_q_tail + DV_Q_CAP) % DV_Q_CAP;
+}
+
+static int dv_q_push(uint8_t *data, size_t size, int64_t pts_90k)
+{
+    pthread_mutex_lock(&dv_q_mu);
+    /* Bounded wait: 500 ms max, then drop rather than hang. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 500000000L;
+    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    while (dv_q_is_full_locked() && !dv_q_stop) {
+        if (pthread_cond_timedwait(&dv_q_nonfull, &dv_q_mu, &deadline) != 0) break;
+    }
+    if (dv_q_is_full_locked() || dv_q_stop) {
+        pthread_mutex_unlock(&dv_q_mu);
+        free(data);
+        return -1;
+    }
+    dv_q[dv_q_head].data    = data;
+    dv_q[dv_q_head].size    = size;
+    dv_q[dv_q_head].pts_90k = pts_90k;
+    dv_q_head = (dv_q_head + 1) % DV_Q_CAP;
+    pthread_cond_signal(&dv_q_nonemp);
+    pthread_mutex_unlock(&dv_q_mu);
+    return 0;
+}
+
+static int dv_q_pop(uint8_t **data_out, size_t *size_out, int64_t *pts_out)
+{
+    pthread_mutex_lock(&dv_q_mu);
+    while (dv_q_is_empty_locked() && !dv_q_stop) {
+        pthread_cond_wait(&dv_q_nonemp, &dv_q_mu);
+    }
+    if (dv_q_stop && dv_q_is_empty_locked()) {
+        pthread_mutex_unlock(&dv_q_mu);
+        return -1;
+    }
+    *data_out = dv_q[dv_q_tail].data;
+    *size_out = dv_q[dv_q_tail].size;
+    *pts_out  = dv_q[dv_q_tail].pts_90k;
+    dv_q_tail = (dv_q_tail + 1) % DV_Q_CAP;
+    pthread_cond_signal(&dv_q_nonfull);
+    pthread_mutex_unlock(&dv_q_mu);
+    return 0;
+}
+
+static void dv_q_drain(void)
+{
+    pthread_mutex_lock(&dv_q_mu);
+    while (!dv_q_is_empty_locked()) {
+        free(dv_q[dv_q_tail].data);
+        dv_q[dv_q_tail].data = NULL;
+        dv_q_tail = (dv_q_tail + 1) % DV_Q_CAP;
+    }
+    dv_q_head = dv_q_tail = 0;
+    pthread_mutex_unlock(&dv_q_mu);
+}
+
+/* Periodic stats — sampled by dv_consumer_main. */
+static uint64_t dv_st_submitted = 0;   /* SET_FRAME calls that returned ok */
+static uint64_t dv_st_dropped   = 0;   /* SET_FRAME calls that gave up after 250ms */
+static uint64_t dv_st_eagain_pollin = 0;
+static uint64_t dv_st_last_log_ns = 0;
+static uint64_t dv_st_last_submitted = 0;
+static uint64_t dv_st_last_dropped   = 0;
+
+/* dreamvideosink (runtime strace):
+ *   - öffnet video0 mit O_NONBLOCK
+ *   - öffnet /dev/amvideo_poll als O_RDWR (hat es offen, polled aber selten)
+ *   - macht VIDEO_GET_EVENT drain initial
+ *   - poll't VIDEO_GET_PTS regelmäßig zwischen SET_FRAMEs
+ *   - bei EAGAIN: wartet auf amvideo_poll. */
+static int dv_submit_frame(int fd, const uint8_t *data, size_t size, int64_t pts_90k)
+{
+    struct video_frame fr;
+    memset(&fr, 0, sizeof(fr));
+    fr.pts = (pts_90k > 0) ? (uint64_t)pts_90k : 0;
+    fr.bytes[0]        = (ssize_t)size;
+    fr.data[0]         = data;
+    fr.is_phys_addr[0] = 0;
+
+    /* Drain a pending event so the kernel buffer-free path can fire. */
+    static int dv_event_buf[8];
+    (void)ioctl(fd, VIDEO_GET_EVENT, dv_event_buf);
+
+    struct pollfd pfds[2];
+    pfds[0].fd = fd;             pfds[0].events = POLLIN;
+    pfds[1].fd = dv_poll_fd;     pfds[1].events = POLLIN;
+    int nfds = (dv_poll_fd >= 0) ? 2 : 1;
+
+    int total_wait_ms = 0;
+    for (;;) {
+        int rc = ioctl(fd, VIDEO_SET_FRAME, &fr);
+        if (rc >= 0) {
+            dv_st_submitted++;
+            /* Poll VIDEO_GET_PTS — gstplayer macht das ständig nach SET_FRAME,
+             * lest den kernel-side video pts aus. */
+            uint64_t vp = 0;
+            (void)ioctl(fd, VIDEO_GET_PTS, &vp);
+            return 0;
+        }
+        if (errno != EAGAIN) {
+            DV_DBG("VIDEO_SET_FRAME (%zu bytes) failed: %s", size, strerror(errno));
+            return -1;
+        }
+        int pr = poll(pfds, nfds, 50);
+        if (pr > 0) dv_st_eagain_pollin++;
+        if (pr <= 0) {
+            total_wait_ms += 50;
+            if (total_wait_ms > 250) { dv_st_dropped++; return 0; }
+        }
+    }
+}
+
+static uint64_t dv_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Submit frames as fast as the kernel video ringbuffer accepts them.
+ * Backpressure comes from dv_submit_frame's EAGAIN+poll loop. gstplayer
+ * runs the same pattern; sampling N360 showed vstream_cache ≈ 550 kB
+ * (≈ 3-4 frames ahead) for gstplayer vs ≈ 12 kB (avg 0.1 frame ahead)
+ * for our previous paced submission — the paced path left the kernel
+ * pacer one demuxer hiccup away from a drop on every frame. */
+static void *dv_consumer_main(void *arg)
+{
+    char tn[16] = "dv_consumer";
+    (void)arg;
+    prctl(PR_SET_NAME, (unsigned long)tn, 0, 0, 0);
+
+    int64_t  pts_90k_mono = 0;     /* fallback when stream PTS missing */
+    int64_t  last_stream_pts = -1; /* discontinuity tracking */
+    dv_st_last_log_ns = dv_now_ns();
+    while (!dv_q_stop) {
+        uint8_t *buf = NULL;
+        size_t   sz  = 0;
+        int64_t  pts_container = -1;
+        if (dv_q_pop(&buf, &sz, &pts_container) < 0) break;
+        pthread_mutex_lock(&dv_q_mu);
+        int qd = dv_q_depth_locked();
+        pthread_mutex_unlock(&dv_q_mu);
+
+        /* Use stream PTS to match the audio path's timebase. Kernel
+         * tsync compares pts_video to pts_audio — if they're in
+         * different bases (monotonic vs stream) it sees huge fake
+         * drift and drops video to "catch up". On big PTS jumps
+         * (stitcher boundary > 5 s) signal tsync discontinuity so the
+         * kernel re-anchors instead of stalling. */
+        int64_t fr_pts = pts_container;
+        if (fr_pts < 0) {
+            fr_pts = pts_90k_mono;
+        } else if (last_stream_pts >= 0) {
+            int64_t jump = fr_pts - last_stream_pts;
+            if (jump < -450000 || jump > 450000) {  /* ±5 s @ 90 kHz */
+                DV_DBG("stream PTS discontinuity: %lld → %lld (%+.2fs) — signalling tsync",
+                       (long long)last_stream_pts, (long long)fr_pts,
+                       (double)jump / 90000.0);
+                int fd = open("/sys/class/tsync/discontinue", O_WRONLY | O_CLOEXEC);
+                if (fd >= 0) { (void)write(fd, "1", 1); close(fd); }
+            }
+        }
+        last_stream_pts = fr_pts;
+
+        if (dv_fd >= 0) dv_submit_frame(dv_fd, buf, sz, fr_pts);
+        free(buf);
+        pts_90k_mono += (int64_t)(dv_frame_dur_ns * 90 / 1000000);
+        uint64_t now = dv_now_ns();
+
+        if (now - dv_st_last_log_ns > 5000000000ULL) {
+            uint64_t s_delta = dv_st_submitted - dv_st_last_submitted;
+            uint64_t d_delta = dv_st_dropped   - dv_st_last_dropped;
+            double secs = (double)(now - dv_st_last_log_ns) / 1e9;
+            DV_DBG("stats: submitted=%llu (+%llu, %.1f/s) dropped=%llu (+%llu, %.1f/s) qdepth=%d frame_dur=%llums pts_inc=%lld",
+                   (unsigned long long)dv_st_submitted, (unsigned long long)s_delta, s_delta/secs,
+                   (unsigned long long)dv_st_dropped, (unsigned long long)d_delta, d_delta/secs,
+                   qd,
+                   (unsigned long long)(dv_frame_dur_ns/1000000ULL),
+                   (long long)(dv_frame_dur_ns * 90LL / 1000000LL));
+            dv_st_last_submitted = dv_st_submitted;
+            dv_st_last_dropped   = dv_st_dropped;
+            dv_st_last_log_ns    = now;
+        }
+    }
+    return NULL;
+}
+
+static void dv_q_start(void)
+{
+    if (dv_q_running) return;
+    dv_q_stop    = 0;
+    dv_q_head    = dv_q_tail = 0;
+    if (pthread_create(&dv_q_thread, NULL, dv_consumer_main, NULL) == 0) {
+        dv_q_running = 1;
+    } else {
+        DV_DBG("pthread_create consumer failed: %s", strerror(errno));
+    }
+}
+
+static void dv_q_shutdown(void)
+{
+    if (!dv_q_running) return;
+    pthread_mutex_lock(&dv_q_mu);
+    dv_q_stop = 1;
+    pthread_cond_broadcast(&dv_q_nonemp);
+    pthread_cond_broadcast(&dv_q_nonfull);
+    pthread_mutex_unlock(&dv_q_mu);
+    pthread_join(dv_q_thread, NULL);
+    dv_q_running = 0;
+    dv_q_drain();
 }
 
 /* ----- Output_t handlers ---------------------------------------------- */
@@ -184,28 +420,33 @@ static int DreamVideoOpen(Context_t *context, char *type)
 
     pthread_mutex_lock(&dv_mutex);
     if (dv_fd < 0) {
-        dv_fd = open(VBUF_DEV, O_WRONLY);
+        /* dreamvideosink öffnet video0 O_NONBLOCK + amvideo_poll O_RDWR. */
+        dv_fd = open(VIDEO_DEV, O_RDWR | O_NONBLOCK);
         if (dv_fd < 0) {
-            DV_DBG("open %s failed: %s", VBUF_DEV, strerror(errno));
+            DV_DBG("open %s failed: %s", VIDEO_DEV, strerror(errno));
             pthread_mutex_unlock(&dv_mutex);
             return cERR_DREAMVIDEO_ERROR;
         }
-        DV_DBG("opened %s (fd=%d)", VBUF_DEV, dv_fd);
-        /* PTS check-in (AMSTREAM_IOC_TSTAMP) doesn't go through
-         * amstream_vbuf in libamcodec — it goes through the control
-         * device /dev/amvideo. Without this fd TSTAMP returns EINVAL
-         * and the decoder never learns the first PTS, so first_stamp
-         * stays 0xffffffff and the pipeline freezes. */
-        dv_cntl_fd = open(CNTL_DEV, O_RDWR);
-        if (dv_cntl_fd < 0)
-            DV_DBG("open %s failed: %s", CNTL_DEV, strerror(errno));
-        else
-            DV_DBG("opened %s (fd=%d)", CNTL_DEV, dv_cntl_fd);
+        dv_install_signal_handlers();
+        dv_q_start();
+        dv_poll_fd = open(AMPOLL_DEV, O_RDWR | O_NONBLOCK);
+        if (dv_poll_fd < 0)
+            DV_DBG("open %s failed: %s", AMPOLL_DEV, strerror(errno));
         dv_enable_display();
-        dv_setup_tsync();
+
+        /* Reset state from any previous (e.g. dreamvideosink) session. */
+        (void)ioctl(dv_fd, VIDEO_STOP, (void *)(uintptr_t)0);
+        (void)ioctl(dv_fd, VIDEO_CLEAR_BUFFER);
+
+        if (ioctl(dv_fd, VIDEO_SELECT_SOURCE, (void *)(uintptr_t)VIDEO_SOURCE_MEMORY) < 0)
+            DV_DBG("SELECT_SOURCE_MEMORY failed: %s", strerror(errno));
+        if (ioctl(dv_fd, VIDEO_FREEZE) < 0)
+            DV_DBG("FREEZE failed: %s", strerror(errno));
     }
     dv_inited = 0;
-    dv_running = 0;
+    dv_playing = 0;
+    dv_frame_index = 0;
+    dv_frame_dur_ns = 20000000ULL;
     pthread_mutex_unlock(&dv_mutex);
     return cERR_DREAMVIDEO_NO_ERROR;
 }
@@ -214,18 +455,26 @@ static int DreamVideoClose(Context_t *context, char *type)
 {
     if (strcmp(type, "video") != 0) return cERR_DREAMVIDEO_NO_ERROR;
 
+    /* Shut down the consumer thread before closing the fd. Drop the
+     * outer mutex first so the consumer (which holds dv_q_mu) can
+     * make forward progress. */
+    pthread_mutex_unlock(&dv_mutex);
+    dv_q_shutdown();
     pthread_mutex_lock(&dv_mutex);
     if (dv_fd >= 0) {
+        /* Return decoder to DEMUX/stopped for the next consumer. */
+        ioctl(dv_fd, VIDEO_STOP, (void *)(uintptr_t)0);
+        ioctl(dv_fd, VIDEO_SELECT_SOURCE, (void *)(uintptr_t)VIDEO_SOURCE_DEMUX);
         close(dv_fd);
         dv_fd = -1;
-        if (dv_cntl_fd >= 0) {
-            close(dv_cntl_fd);
-            dv_cntl_fd = -1;
-        }
-        dv_restore_tsync();
     }
+    if (dv_poll_fd >= 0) {
+        close(dv_poll_fd);
+        dv_poll_fd = -1;
+    }
+    dv_restore_display();
     dv_inited = 0;
-    dv_running = 0;
+    dv_playing = 0;
     dv_current_pts = 0;
     pthread_mutex_unlock(&dv_mutex);
     DV_DBG("closed");
@@ -234,30 +483,10 @@ static int DreamVideoClose(Context_t *context, char *type)
 
 static int DreamVideoPlay(Context_t *context, char *type)
 {
+    /* Actual VIDEO_PLAY happens after SET_DEC_SYSINFO in dv_lazy_init. */
     if (strcmp(type, "video") != 0) return cERR_DREAMVIDEO_NO_ERROR;
-
     pthread_mutex_lock(&dv_mutex);
-    if (dv_fd >= 0) {
-        char *Encoding = NULL;
-        context->manager->video->Command(context, MANAGER_GETENCODING, &Encoding);
-        Writer_t *writer = getWriter(Encoding);
-        if (writer) {
-            uint32_t vformat = 0, dec_format = 0;
-            if (aml_format_for(writer->caps->dvbStreamType, &vformat, &dec_format) == 0) {
-                if (ioctl(dv_fd, AMSTREAM_IOC_VFORMAT, vformat) < 0)
-                    DV_DBG("VFORMAT %u failed: %s", vformat, strerror(errno));
-                else
-                    DV_DBG("VFORMAT set to %u (%s)", vformat, writer->caps->name);
-                /* ES mode: VID=0xffff means no stream-id filtering. */
-                ioctl(dv_fd, AMSTREAM_IOC_VID, 0xffff);
-            } else {
-                DV_DBG("no AML mapping for streamtype %d (encoding %s)",
-                       writer->caps->dvbStreamType, Encoding);
-            }
-        }
-        free(Encoding);
-    }
-    dv_running = 1;
+    dv_playing = 1;
     pthread_mutex_unlock(&dv_mutex);
     return cERR_DREAMVIDEO_NO_ERROR;
 }
@@ -275,7 +504,7 @@ static int DreamVideoPts(Context_t *context, unsigned long long *pts)
     return cERR_DREAMVIDEO_NO_ERROR;
 }
 
-/* ----- Write ---------------------------------------------------------- */
+/* ----- Lazy init (first packet has width/height/fps) ------------------ */
 
 static int dv_lazy_init(Context_t *context, AudioVideoOut_t *out)
 {
@@ -284,45 +513,92 @@ static int dv_lazy_init(Context_t *context, AudioVideoOut_t *out)
     char *Encoding = NULL;
     context->manager->video->Command(context, MANAGER_GETENCODING, &Encoding);
     Writer_t *writer = getWriter(Encoding);
-    if (!writer) {
-        free(Encoding);
-        return -1;
-    }
-
-    uint32_t vformat = 0, dec_format = 0;
-    if (aml_format_for(writer->caps->dvbStreamType, &vformat, &dec_format) < 0) {
-        free(Encoding);
-        return -1;
-    }
     free(Encoding);
+    if (!writer) return -1;
 
-    struct aml_dec_sysinfo si;
+    uint32_t dec_format = 0;
+    int streamtype = 0;
+    if (dv_decformat_for(writer->caps->dvbStreamType, &dec_format) < 0 ||
+        dv_streamtype_for(writer->caps->dvbStreamType, &streamtype)  < 0) {
+        DV_DBG("no codec mapping for streamtype %d", writer->caps->dvbStreamType);
+        return -1;
+    }
+
+    struct dec_sysinfo si;
     memset(&si, 0, sizeof(si));
     si.format = dec_format;
     si.width  = out->width;
     si.height = out->height;
-    /* rate is duration-per-frame in 96000-unit ticks, NOT fps.
-     * exteplayer3 reports frameRate as e.g. 50000 milli-fps. */
-    if (out->frameRate > 0)
+    /* rate = frame duration in 96000-tick units (out->frameRate is milli-fps). */
+    if (out->frameRate > 0) {
         si.rate = (uint32_t)((uint64_t)96000ULL * 1000U / out->frameRate);
-    else
-        si.rate = 3200;     /* 30 fps fallback */
-    si.param  = (void *)(uintptr_t)(AML_EXTERNAL_PTS | AML_SYNC_OUTSIDE);
+        dv_frame_dur_ns = (uint64_t)1000000000ULL * 1000ULL / (uint64_t)out->frameRate;
+    } else {
+        si.rate = 3200;
+        dv_frame_dur_ns = 33333333ULL;     /* ~30 fps fallback */
+    }
+    /* param must stay NULL — non-zero values wedge the decoder. */
+    si.param = NULL;
 
-    if (ioctl(dv_fd, AMSTREAM_IOC_SYSINFO, &si) < 0) {
-        DV_DBG("SYSINFO failed: %s", strerror(errno));
+    DV_DBG("lazy_init: w=%u h=%u out->frameRate(milli-fps)=%u → si.rate=%u(96k/frame) dv_frame_dur=%llums dec_format=%u streamtype=%d",
+           out->width, out->height, out->frameRate, si.rate,
+           (unsigned long long)(dv_frame_dur_ns/1000000ULL), dec_format, streamtype);
+    if (ioctl(dv_fd, VIDEO_SET_DEC_SYSINFO, &si) < 0) {
+        DV_DBG("VIDEO_SET_DEC_SYSINFO failed: %s", strerror(errno));
         return -1;
     }
-    if (ioctl(dv_fd, AMSTREAM_IOC_PORT_INIT) < 0) {
-        DV_DBG("PORT_INIT failed: %s", strerror(errno));
+    if (ioctl(dv_fd, VIDEO_SET_STREAMTYPE, (void *)(uintptr_t)streamtype) < 0) {
+        DV_DBG("VIDEO_SET_STREAMTYPE %d failed: %s", streamtype, strerror(errno));
         return -1;
     }
-    DV_DBG("inited: dec_format=%u %ux%u rate=%u param=0x%x",
-           si.format, si.width, si.height, si.rate,
-           AML_EXTERNAL_PTS | AML_SYNC_OUTSIDE);
+    if (ioctl(dv_fd, VIDEO_PLAY) < 0)
+        DV_DBG("VIDEO_PLAY failed: %s", strerror(errno));
+    if (ioctl(dv_fd, VIDEO_SLOWMOTION, (void *)(uintptr_t)0) < 0)
+        DV_DBG("VIDEO_SLOWMOTION failed: %s", strerror(errno));
+    if (ioctl(dv_fd, VIDEO_FAST_FORWARD, (void *)(uintptr_t)0) < 0)
+        DV_DBG("VIDEO_FAST_FORWARD failed: %s", strerror(errno));
+    if (ioctl(dv_fd, VIDEO_CONTINUE, (void *)(uintptr_t)5) < 0)
+        DV_DBG("VIDEO_CONTINUE failed: %s", strerror(errno));
+
     dv_inited = 1;
     return 0;
 }
+
+/* ----- WriteV hook: hand iovec off to the consumer thread ------------- */
+
+static ssize_t dv_set_frame_writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    (void)fd;
+    (void)dv_frame_index;
+    (void)dv_frame_dur_ns;
+
+    /* Coalesce iovec and hand off to the consumer thread. */
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
+    if (total == 0) return 0;
+
+    uint8_t *buf = malloc(total);
+    if (!buf) {
+        DV_DBG("malloc(%zu) failed: %s", total, strerror(errno));
+        return -1;
+    }
+    size_t off = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len == 0) continue;
+        memcpy(buf + off, iov[i].iov_base, iov[i].iov_len);
+        off += iov[i].iov_len;
+    }
+
+    /* Snapshot the per-call PTS DreamVideoWrite cached for this frame
+     * so the consumer thread can tag fr.pts properly. */
+    int64_t pts_90k = (int64_t)dv_current_pts;
+    /* Push either succeeded (consumer owns buf) or queue full/stopping
+     * (dv_q_push freed buf). Report success either way. */
+    (void)dv_q_push(buf, total, pts_90k);
+    return (ssize_t)total;
+}
+
+/* ----- Write --------------------------------------------------------- */
 
 static int DreamVideoWrite(void *_context, void *_out)
 {
@@ -340,23 +616,19 @@ static int DreamVideoWrite(void *_context, void *_out)
         pthread_mutex_unlock(&dv_mutex);
         return cERR_DREAMVIDEO_ERROR;
     }
+    /* Keep dv_frame_dur_ns aligned with the actual source rate even when
+     * lazy_init didn't run (first frames sometimes arrive with w/h=0).
+     * Without this the consumer keeps its 50fps init pacing and the
+     * kernel decoder swamps the display pipeline (input_fps=50 for a
+     * 25fps source → 4-15 frames/sec dropped, visible stutter). */
+    if (out->frameRate > 0)
+        dv_frame_dur_ns = (uint64_t)1000000000ULL * 1000ULL / (uint64_t)out->frameRate;
 
-    /* PTS handed to the decoder via TSTAMP (90 kHz, low 32 bits) on the
-     * /dev/amvideo control fd — NOT amstream_vbuf. _IOW(... int) means
-     * the kernel does copy_from_user, so we pass a POINTER, not the
-     * value (libamcodec's codec_h_control plays the same trick by
-     * passing 'unsigned long paramter' which on aarch64 is the same
-     * width as a pointer). */
-    if (out->pts != (int64_t)INVALID_PTS_VALUE && out->pts >= 0 && dv_cntl_fd >= 0) {
-        unsigned int pts32 = (unsigned int)(out->pts & 0xFFFFFFFF);
-        if (ioctl(dv_cntl_fd, AMSTREAM_IOC_TSTAMP, &pts32) < 0)
-            DV_DBG("TSTAMP failed: %s", strerror(errno));
+    /* Cached for OUTPUT_PTS; the writev hook itself always feeds the
+     * decoder pts=0 (see dv_submit_frame). */
+    if (out->pts != (int64_t)INVALID_PTS_VALUE && out->pts >= 0)
         dv_current_pts = (unsigned long long)out->pts;
-    }
 
-    /* Build the iovec via the existing per-codec writer. With the
-     * raw-ES patch in h264.c (and friends), iov[0].iov_len = 0 so
-     * the PES header is skipped — what comes out is Annex-B NALU. */
     char *Encoding = NULL;
     context->manager->video->Command(context, MANAGER_GETENCODING, &Encoding);
     Writer_t *writer = getWriter(Encoding);
@@ -382,7 +654,7 @@ static int DreamVideoWrite(void *_context, void *_out)
     call.Height       = out->height;
     call.InfoFlags    = out->infoFlags;
     call.Version      = 0;
-    call.WriteV       = writev_with_retry;
+    call.WriteV       = dv_set_frame_writev;
 
     int res = writer->writeData(&call);
     pthread_mutex_unlock(&dv_mutex);
@@ -407,9 +679,19 @@ static int DreamVideoCommand(void *_context, OutputCmd_t cmd, void *arg)
     case OUTPUT_STOP:    return DreamVideoStop(context, (char *)arg);
     case OUTPUT_PTS:     return DreamVideoPts(context, (unsigned long long *)arg);
     case OUTPUT_FLUSH:
+    case OUTPUT_CLEAR:
+        /* Drain queue + clear kernel ring + signal tsync discontinuity. */
+        pthread_mutex_lock(&dv_mutex);
+        dv_q_drain();
+        if (dv_fd >= 0) (void)ioctl(dv_fd, VIDEO_CLEAR_BUFFER);
+        pthread_mutex_unlock(&dv_mutex);
+        {
+            int fd = open("/sys/class/tsync/discontinue", O_WRONLY | O_CLOEXEC);
+            if (fd >= 0) { (void)write(fd, "1", 1); close(fd); }
+        }
+        return cERR_DREAMVIDEO_NO_ERROR;
     case OUTPUT_PAUSE:
     case OUTPUT_CONTINUE:
-    case OUTPUT_CLEAR:
     case OUTPUT_SWITCH:
     case OUTPUT_AVSYNC:
     case OUTPUT_SLOWMOTION:

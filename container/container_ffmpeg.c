@@ -232,6 +232,7 @@ static int32_t aac_latm_software_decode = 0;
 static int32_t ac3_software_decode = 0;
 static int32_t eac3_software_decode = 0;
 static int32_t dts_software_decode = 0;
+static int32_t truehd_software_decode = 0;
 static int32_t amr_software_decode = 1;
 static int32_t vorbis_software_decode = 1;
 static int32_t opus_software_decode = 1;
@@ -292,6 +293,11 @@ void eac3_software_decoder_set(const int32_t val)
 void dts_software_decoder_set(const int32_t val)
 {
     dts_software_decode = val;
+}
+
+void truehd_software_decoder_set(const int32_t val)
+{
+    truehd_software_decode = val;
 }
 
 void amr_software_decoder_set(const int32_t val)
@@ -450,8 +456,9 @@ static char* Codec2Encoding(int32_t codec_id, int32_t media_type, uint8_t *extra
         return (wma_software_decode) ? "A_IPCM" : "A_WMA/PRO";
     case AV_CODEC_ID_WMALOSSLESS:
         return "A_IPCM";
+    case AV_CODEC_ID_TRUEHD:
     case AV_CODEC_ID_MLP:
-        return "A_IPCM";
+        return truehd_software_decode ? "A_IPCM" : "A_TRUEHD";
     case AV_CODEC_ID_RA_144:
         return "A_IPCM";
     case AV_CODEC_ID_RA_288:
@@ -749,12 +756,14 @@ static void FFMPEGThread(Context_t *context)
                     }
                 }
                 reset_finish_timeout();
-                /*
-                if (bufferSize > 0)
-                {
-                    context->output->Command(context, OUTPUT_CLEAR, NULL);
-                }
-                */
+                /* OUTPUT_CLEAR here was tried as a gstreamer FLUSH equivalent
+                 * but this path is NOT the seek boundary — it runs every
+                 * av_read_frame iteration that still passes the gate. On
+                 * HLS stitched sources (PlutoTV) it fired on every stitcher
+                 * segment boundary and starved the audio producer: vpts
+                 * stuck for minutes with av_drift = -425000 ms. Leaving
+                 * disabled. dream_audio's da_reset_anchor_locked() stays
+                 * available for when a real seek-completed wiring exists. */
             }
             else
             {
@@ -1894,6 +1903,18 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
             av_dict_set(&avio_opts, "reconnect_streamed", "1", 0);
         }
 
+        /* HLS-only; persistent keep-alive + larger recv buffer upset
+         * low-bitrate icecast otherwise. */
+        if (strstr(filename, ".m3u"))
+        {
+            av_dict_set(&avio_opts, "recv_buffer_size",  "4194304", 0);
+            av_dict_set(&avio_opts, "multiple_requests",       "1", 0);
+            av_dict_set(&avio_opts, "live_start_index",       "-3", 0);
+            av_dict_set(&avio_opts, "max_reload",             "10", 0);
+            av_dict_set(&avio_opts, "http_persistent",         "1", 0);
+            av_dict_set(&avio_opts, "http_multiple",           "1", 0);
+        }
+
         if( strncmp(filename, "http://127.0.0.1", 16) == 0 )
         {
             /* when using with ArchivCZSK, then indicate DRM support */
@@ -1902,6 +1923,21 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
     }
 
     pavio_opts = &avio_opts;
+
+    /* Cap the probe for local files; avformat_open_input ignores the
+     * matching av_dict keys, so pre-allocate the context and set them
+     * directly. Network URIs keep the defaults. */
+    {
+        const int is_local = (strstr(filename, "://") == NULL)
+                          || (strncmp(filename, "file://", 7) == 0);
+        if (is_local) {
+            avContextTab[AVIdx] = avformat_alloc_context();
+            if (avContextTab[AVIdx]) {
+                avContextTab[AVIdx]->probesize            = 10000000;
+                avContextTab[AVIdx]->max_analyze_duration =  3000000;
+            }
+        }
+    }
 
     if ((err = avformat_open_input(&avContextTab[AVIdx], filename, fmt, pavio_opts)) != 0)
     {
