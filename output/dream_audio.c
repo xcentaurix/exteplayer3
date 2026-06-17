@@ -238,7 +238,13 @@ static void da_log_emit(const char *line)
     static int   tried = 0;
     if (!fp && !tried) {
         tried = 1;
-        fp = fopen("/tmp/dream_audio.log", "a");
+        int fd = open("/tmp/dream_audio.log", // NOSONAR
+                      O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC,
+                      0600);
+        if (fd >= 0) {
+            fp = fdopen(fd, "a");
+            if (!fp) close(fd);
+        }
         if (fp) setvbuf(fp, NULL, _IOLBF, 0);
     }
     if (!fp) return;

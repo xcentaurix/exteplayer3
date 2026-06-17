@@ -1010,7 +1010,7 @@ int main(int argc, char* argv[])
      * for h264 and the AML hw decoder gets no dimensions, no video. */
     if (strncmp(playbackFiles.szFirstFile, "rtmp",    4) &&
         strncmp(playbackFiles.szFirstFile, "ffrtmp",  6) &&
-        strncmp(playbackFiles.szFirstFile, "http://",  7) &&
+        strncmp(playbackFiles.szFirstFile, "http://",  7) && /* NOSONAR S5332 */
         strncmp(playbackFiles.szFirstFile, "https://", 8))
     {
         g_player->playback->noprobe = 1;
