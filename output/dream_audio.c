@@ -114,6 +114,13 @@ static int64_t         da_last_reanchor_ms  = 0;
 static int64_t         da_last_huge_gap_ms  = 0;
 static int64_t         da_drift_outside_since_ms = 0;
 static int64_t         da_last_sync_log_ms  = 0;
+/* vpts-frozen suppression: when the kernel video decoder stalls (DASH
+ * segment underrun on hr-live etc.) pts_video stops advancing and the
+ * anchor would otherwise flush ALSA + push silence on every cycle. Skip
+ * destructive actions while frozen, audio keeps playing. */
+static int64_t         da_last_seen_vpts        = -1;
+static int64_t         da_last_vpts_change_ms   = 0;
+#define DA_VPTS_FROZEN_MS  2000
 
 /* Active passthrough codec: 1=AC3, 2=EAC3, 3=DTS (IEC61937 bursts),
  * 4=TrueHD, 5=DTS-HD MA (HBR via libavformat spdif muxer). */
@@ -940,6 +947,8 @@ static int DreamAudioOpen(Context_t *context, char *type)
     da_last_huge_gap_ms         = 0;
     da_drift_outside_since_ms   = 0;
     da_last_sync_log_ms         = 0;
+    da_last_seen_vpts           = -1;
+    da_last_vpts_change_ms      = 0;
     int ret = da_alsa_open_handle();
     da_paused = 0;
     da_running = 0;
@@ -1011,6 +1020,8 @@ static void da_reset_anchor_locked(void)
     da_last_huge_gap_ms         = 0;
     da_drift_outside_since_ms   = 0;
     da_last_sync_log_ms         = 0;
+    da_last_seen_vpts           = -1;
+    da_last_vpts_change_ms      = 0;
 }
 
 static int DreamAudioStop(Context_t *context, char *type)
@@ -1262,11 +1273,23 @@ static void *da_consumer_main(void *arg)
         if (da_anchor_armed && apts_speaker >= 0 && rate && fb) {
             int64_t pts_v = da_read_pts_video();
             if (pts_v >= 0) {
-                int32_t lead_ms = (int32_t)((uint32_t)apts_speaker - (uint32_t)pts_v) / 90;
-                DA_DBG("anchor: lead=%+dms vpts=%lx apts=%lx",
-                       lead_ms, (long)pts_v, (long)apts_speaker);
                 int64_t now_ms_hg = da_monotonic_ms();
-                if ((lead_ms > 2000 || lead_ms < -2000)
+                if (pts_v != da_last_seen_vpts) {
+                    da_last_seen_vpts      = pts_v;
+                    da_last_vpts_change_ms = now_ms_hg;
+                }
+                int vpts_frozen = (da_last_vpts_change_ms != 0
+                                   && now_ms_hg - da_last_vpts_change_ms > DA_VPTS_FROZEN_MS);
+
+                int32_t lead_ms = (int32_t)((uint32_t)apts_speaker - (uint32_t)pts_v) / 90;
+                DA_DBG("anchor: lead=%+dms vpts=%lx apts=%lx%s",
+                       lead_ms, (long)pts_v, (long)apts_speaker,
+                       vpts_frozen ? " [vpts frozen, skip]" : "");
+                if (vpts_frozen) {
+                    /* Video decoder stalled (DASH segment underrun, etc).
+                     * Skip destructive actions, let audio play through.
+                     * anchor stays armed so we re-evaluate when vpts moves. */
+                } else if ((lead_ms > 2000 || lead_ms < -2000)
                     && now_ms_hg - da_last_huge_gap_ms > 1000)
                 {
                     da_last_huge_gap_ms = now_ms_hg;
@@ -1276,11 +1299,11 @@ static void *da_consumer_main(void *arg)
                     pthread_mutex_unlock(&da_mutex);
                     free(item.data);
                     continue;
-                }
-                if (lead_ms > 50) {
+                } else if (lead_ms > 50) {
                     int adj = lead_ms > 2000 ? 2000 : lead_ms;
                     da_push_silence_ms(adj);
                     DA_DBG("anchor: pushed %dms silence (was %+dms ahead)", adj, lead_ms);
+                    da_anchor_armed = 0;
                 } else if (lead_ms < -50) {
                     int adj = lead_ms < -3000 ? -3000 : lead_ms;
                     da_skip_bytes_remaining =
@@ -1291,8 +1314,10 @@ static void *da_consumer_main(void *arg)
                     da_skip_bytes_remaining -= drop;
                     write_data += drop;
                     write_len  -= drop;
+                    da_anchor_armed = 0;
+                } else {
+                    da_anchor_armed = 0;
                 }
-                da_anchor_armed = 0;
             }
         }
 
@@ -1302,21 +1327,32 @@ static void *da_consumer_main(void *arg)
             if (pts_v >= 0) {
                 int32_t av_ms  = (int32_t)((uint32_t)apts_speaker - (uint32_t)pts_v) / 90;
                 int64_t now_ms = da_monotonic_ms();
+                if (pts_v != da_last_seen_vpts) {
+                    da_last_seen_vpts      = pts_v;
+                    da_last_vpts_change_ms = now_ms;
+                }
+                int vpts_frozen = (da_last_vpts_change_ms != 0
+                                   && now_ms - da_last_vpts_change_ms > DA_VPTS_FROZEN_MS);
 
                 /* 30s heartbeat. */
                 if (now_ms - da_last_sync_log_ms > 30000) {
                     pthread_mutex_lock(&da_q_mu);
                     int qd = da_q_depth_locked();
                     pthread_mutex_unlock(&da_q_mu);
-                    DA_DBG("vpts=%lx apts=%lx av=%+dms hw_delay=%lldms q=%d/%d [heartbeat]",
+                    DA_DBG("vpts=%lx apts=%lx av=%+dms hw_delay=%lldms q=%d/%d%s [heartbeat]",
                            (long)pts_v, (long)apts_speaker, av_ms,
-                           (long long)(alsa_delay_pts / 90), qd, DA_Q_CAP - 1);
+                           (long long)(alsa_delay_pts / 90), qd, DA_Q_CAP - 1,
+                           vpts_frozen ? " VFROZEN" : "");
                     da_last_sync_log_ms = now_ms;
                 }
 
-                /* Re-arm anchor when |av| > 1000ms held >=2s; 5s cooldown. */
+                /* Re-arm anchor when |av| > 1000ms held >=2s; 5s cooldown.
+                 * Skipped while vpts is frozen — destructive re-arm would
+                 * just flush audio repeatedly. */
                 int32_t abs_av = av_ms < 0 ? -av_ms : av_ms;
-                if (abs_av > 1000) {
+                if (vpts_frozen) {
+                    da_drift_outside_since_ms = 0;
+                } else if (abs_av > 1000) {
                     if (da_drift_outside_since_ms == 0)
                         da_drift_outside_since_ms = now_ms;
                 } else {
