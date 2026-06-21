@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <math.h>
 #include <sys/poll.h>
 #include <pthread.h>
 #include <sys/prctl.h>
@@ -446,6 +447,9 @@ static char* Codec2Encoding(int32_t codec_id, int32_t media_type, uint8_t *extra
         return  (ac3_software_decode) ? "A_IPCM" : "A_AC3";
     case AV_CODEC_ID_EAC3:
         return  (eac3_software_decode) ? "A_IPCM" : "A_EAC3";
+    case AV_CODEC_ID_AC4:
+        /* No kernel AC-4 writer — always software decode via librempeg. */
+        return "A_IPCM";
     case AV_CODEC_ID_DTS:
         return (dts_software_decode) ? "A_IPCM" : "A_DTS";
     case AV_CODEC_ID_WMAV1:
@@ -635,6 +639,8 @@ static void FFMPEGThread(Context_t *context)
     SwrContext *swr = NULL;
     AVFrame *decoded_frame = NULL;
     int32_t out_sample_rate = 44100;
+    int ac4_immersive_ok = 0;   /* librempeg AC-4 may fill only ch[0] — promote once others wake */
+    int ac4_probe_streak = 0;
 #if HAVE_CH_LAYOUT
     AVChannelLayout out_channel_layout;
     av_channel_layout_default(&out_channel_layout, 2);
@@ -1187,7 +1193,44 @@ static void FFMPEGThread(Context_t *context)
                                 out_channels = 2;
                             }
 
-                            av_opt_set_chlayout(swr, "in_chlayout", &c->ch_layout,	0);
+                            /* librempeg AC-4 immersive only fills ch[0] today;
+                             * probe upper channels for signal, latch full
+                             * layout on first non-zero hit, else feed mono. */
+                            AVChannelLayout in_chl_ac4;
+                            av_channel_layout_copy(&in_chl_ac4, &c->ch_layout);
+                            if (c->codec_id == AV_CODEC_ID_AC4 && in_chl_ac4.nb_channels > 2)
+                            {
+                                if (!ac4_immersive_ok && decoded_frame &&
+                                    (enum AVSampleFormat)c->sample_fmt == AV_SAMPLE_FMT_FLTP)
+                                {
+                                    int nch = in_chl_ac4.nb_channels;
+                                    int probe = (decoded_frame->nb_samples < 1024) ? decoded_frame->nb_samples : 1024;
+                                    float peak0 = 0.0f, peak_rest = 0.0f;
+                                    const float *p0 = (const float *)decoded_frame->extended_data[0];
+                                    if (p0) for (int i = 0; i < probe; ++i) {
+                                        float a = fabsf(p0[i]); if (a > peak0) peak0 = a;
+                                    }
+                                    for (int ch = 1; ch < nch; ++ch) {
+                                        const float *p = (const float *)decoded_frame->extended_data[ch];
+                                        if (!p) continue;
+                                        for (int i = 0; i < probe; ++i) {
+                                            float a = fabsf(p[i]); if (a > peak_rest) peak_rest = a;
+                                        }
+                                    }
+                                    if (peak0 > 0.01f && peak_rest > peak0 * 0.3f) {
+                                        if (++ac4_probe_streak >= 8) ac4_immersive_ok = 1;
+                                    } else {
+                                        ac4_probe_streak = 0;
+                                    }
+                                }
+                                if (!ac4_immersive_ok)
+                                {
+                                    av_channel_layout_uninit(&in_chl_ac4);
+                                    av_channel_layout_default(&in_chl_ac4, 1);
+                                }
+                            }
+
+                            av_opt_set_chlayout(swr, "in_chlayout", &in_chl_ac4,	0);
                             av_opt_set_chlayout(swr, "out_chlayout", &out_channel_layout,	0);
                             av_opt_set_sample_fmt(swr, "out_sample_fmt",    AV_SAMPLE_FMT_S16,     0);
                             av_opt_set_sample_fmt(swr, "in_sample_fmt",     c->sample_fmt, 0);
@@ -1205,7 +1248,9 @@ static void FFMPEGThread(Context_t *context)
 #endif
                             av_opt_set_int(swr, "in_sample_rate",		c->sample_rate,		0);
                             av_opt_set_int(swr, "out_sample_rate",		out_sample_rate,	0);
-
+                            /* Matrix peak cap: 1.0 anti-clips 5.1; 3.0 keeps 7.1.4 audible. */
+                            av_opt_set_double(swr, "rematrix_maxval",
+                                              (out_channels >= 10) ? 3.0 : 1.0, 0);
 
                             e = swr_init(swr);
                             if (e < 0)
@@ -1243,7 +1288,10 @@ static void FFMPEGThread(Context_t *context)
                                          ((AVStream*) audioTrack->stream)->time_base.num * (int64_t)out_sample_rate * c->sample_rate);
 
                         currentAudioPts = audioTrack->pts = pts = calcPts(cAVIdx, audioTrack->stream, next_out_pts);
-                        out_samples = swr_convert(swr, &output[0], out_samples, (const uint8_t **) &decoded_frame->data[0], in_samples);
+                        /* extended_data is sized for nb_channels; data[0..7] only
+                         * has 8 slots which would overflow for 7.1.4 (12 channels). */
+                        out_samples = swr_convert(swr, &output[0], out_samples,
+                                                  (const uint8_t **) decoded_frame->extended_data, in_samples);
 
                         //////////////////////////////////////////////////////////////////////
                         // Update pcmExtradata according to decode parameters
